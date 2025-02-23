@@ -1,36 +1,205 @@
 "use client"
 /*
-v1.3: Fixed import paths for Avatar, Button, and Input to use @/components/ui.
-v1.4: Updated to use FeatherIcon for button images as per user's instructions.
-v1.5: Added voice mode integration for Gemini audio chat using native WebSocket and audio processing.
-Optimization notes:
-- Added voice recording functionality that only displays when voice mode is active.
-- Gemini API key is read from the environment using Vite’s import.meta.env.
-- Uses native WebSocket and Web Audio APIs—no extra libraries are needed.
+v1.10:
+- Modified file upload flow so that when a document is selected, a file preview (with a file-text icon and file name) appears in the chat input area.
+- The attached file is not immediately sent to the Gemini API; instead, when the user submits the message, both the file and the text prompt (if any) are sent together.
+- The API call is made with extended token limits for both input and output.
+- Gemini API responses are now rendered as rich text (using dangerouslySetInnerHTML) so that bullet points, bold text, and other formatting are shown.
 */
-// src/pages/ChatInterface.jsx
 
-import React, { useState, useRef } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Avatar } from "@/components/ui/avatar.jsx";
 import { Button } from "@/components/ui/button.jsx";
 import { Input } from "@/components/ui/input.jsx";
 import { FeatherIcon } from "@/components/ui/FeatherIcon.jsx";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 function ChatInterface() {
+  // Conversation state: each conversation has id, title, date, messages (array of {id, content, sender, [type]})
+  const [conversations, setConversations] = useState([]);
+  const [currentConversationId, setCurrentConversationId] = useState(null);
+  const [chatSession, setChatSession] = useState(null); // Gemini chat session for active conversation
   const [isVoiceMode, setIsVoiceMode] = useState(false);
-  const [message, setMessage] = useState("");
   const [recording, setRecording] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
+  const [message, setMessage] = useState("");
+  // New state for file attachment
+  const [attachedFile, setAttachedFile] = useState(null);
 
-  // Refs for voice recording
+  // Ref for file input for document upload
+  const fileInputRef = useRef(null);
+
+  // Refs for voice recording (unchanged)
   const wsRef = useRef(null);
   const mediaStreamRef = useRef(null);
   const audioContextRef = useRef(null);
-  const scriptProcessorRef = useRef(null);
+  const workletNodeRef = useRef(null);
 
-  // Gemini WebSocket URL using the API key from the .env file
+  // Gemini WebSocket URL for voice mode (unchanged)
   const GEMINI_WS_URL = `wss://gemini.googleapis.com/v1alpha/live?api_key=${import.meta.env.VITE_GEMINI_API_KEY}`;
 
-  // Helper: Convert Float32 samples to 16-bit PCM
+  // Load conversations from local storage on mount
+  useEffect(() => {
+    const stored = localStorage.getItem("conversations");
+    if (stored) {
+      const convs = JSON.parse(stored);
+      setConversations(convs);
+      if (convs.length > 0) {
+        setCurrentConversationId(convs[0].id);
+      }
+    } else {
+      const initialConversation = { id: Date.now(), title: "Chat", date: new Date().toLocaleDateString(), messages: [] };
+      setConversations([initialConversation]);
+      setCurrentConversationId(initialConversation.id);
+    }
+  }, []);
+
+  // Helper to update conversations in state and local storage
+  const updateConversations = (updatedConversations) => {
+    setConversations(updatedConversations);
+    localStorage.setItem("conversations", JSON.stringify(updatedConversations));
+  };
+
+  // Get current conversation messages
+  const currentConversation = conversations.find((conv) => conv.id === currentConversationId) || { messages: [] };
+
+  // Helper to convert ArrayBuffer to Base64 string
+  function arrayBufferToBase64(buffer) {
+    let binary = "";
+    const bytes = new Uint8Array(buffer);
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary);
+  }
+
+  // Handle file picker click to trigger hidden file input
+  const handleFilePickerClick = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.click();
+    }
+  };
+
+  // Handle document file upload – now simply reads and stores the file (showing a preview) without calling the API immediately
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const base64Data = arrayBufferToBase64(arrayBuffer);
+      setAttachedFile({
+        fileName: file.name,
+        base64: base64Data,
+        mimeType: file.type || "application/pdf",
+      });
+    } catch (error) {
+      console.error("Error reading file:", error);
+    }
+  };
+
+  // Gemini Text / Document Integration: Handle message submission
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    // If there's no text and no attached file, do nothing
+    if (!message.trim() && !attachedFile) return;
+
+    setIsThinking(true);
+    let updatedConversations = [...conversations];
+
+    // If a file is attached, add a file message bubble
+    if (attachedFile) {
+      const fileMessage = { id: Date.now() + "_file", content: attachedFile.fileName, sender: "user", type: "file" };
+      updatedConversations = updatedConversations.map((conv) => {
+        if (conv.id === currentConversationId) {
+          return { ...conv, messages: [...conv.messages, fileMessage] };
+        }
+        return conv;
+      });
+    }
+
+    // If text is provided, add a text message bubble
+    if (message.trim()) {
+      const userTextMessage = { id: Date.now() + "_text", content: message, sender: "user" };
+      updatedConversations = updatedConversations.map((conv) => {
+        if (conv.id === currentConversationId) {
+          return { ...conv, messages: [...conv.messages, userTextMessage] };
+        }
+        return conv;
+      });
+    }
+    updateConversations(updatedConversations);
+
+    try {
+      const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY);
+      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+      let result;
+      // If a file is attached, use generateContent to send both the file and the text prompt together
+      if (attachedFile) {
+        result = await model.generateContent([
+          {
+            inlineData: {
+              data: attachedFile.base64,
+              mimeType: attachedFile.mimeType,
+            },
+          },
+          message.trim() ? message : ""
+        ], { maxInputTokens: 4096, maxOutputTokens: 4096 });
+      } else {
+        // Text-only flow: use the chat session (extending output tokens)
+        if (!chatSession) {
+          const newChat = model.startChat({
+            history: [{ role: "user", parts: [{ text: message }] }],
+            maxOutputTokens: 4096,
+          });
+          setChatSession(newChat);
+          result = await newChat.sendMessage("", { maxOutputTokens: 4096 });
+        } else {
+          result = await chatSession.sendMessage(message, { maxOutputTokens: 4096 });
+        }
+      }
+      // Assume the response is rich HTML content; render it as such
+      const aiText = result.response.text();
+      const aiMessage = { id: Date.now() + "_ai", content: aiText, sender: "ai" };
+      const convsAfterAI = updatedConversations.map((conv) => {
+        if (conv.id === currentConversationId) {
+          return { ...conv, messages: [...conv.messages, aiMessage] };
+        }
+        return conv;
+      });
+      updateConversations(convsAfterAI);
+    } catch (error) {
+      console.error("Error during Gemini generation:", error);
+      const errorMessage = { id: Date.now() + "_error", content: "Error: Unable to get response from Gemini.", sender: "ai" };
+      const convsAfterError = updatedConversations.map((conv) => {
+        if (conv.id === currentConversationId) {
+          return { ...conv, messages: [...conv.messages, errorMessage] };
+        }
+        return conv;
+      });
+      updateConversations(convsAfterError);
+    } finally {
+      setIsThinking(false);
+      setMessage("");
+      setAttachedFile(null);
+    }
+  };
+
+  // New conversation: resets chat session and creates a new conversation
+  const handleNewConversation = () => {
+    const newConv = { id: Date.now(), title: "Chat " + new Date().toLocaleTimeString(), date: new Date().toLocaleDateString(), messages: [] };
+    const updatedConvs = [newConv, ...conversations];
+    updateConversations(updatedConvs);
+    setCurrentConversationId(newConv.id);
+    setChatSession(null);
+  };
+
+  // Handle selecting an existing conversation
+  const handleSelectConversation = (id) => {
+    setCurrentConversationId(id);
+    setChatSession(null); // Reset chat session for selected conversation
+  };
+
+  // Voice recording helper functions (unchanged)
   function convertFloat32ToInt16(buffer) {
     const l = buffer.length;
     const result = new Int16Array(l);
@@ -41,7 +210,6 @@ function ChatInterface() {
     return result;
   }
 
-  // Helper: Downsample Int16Array from sampleRate to outSampleRate using averaging
   function downsampleBuffer(buffer, sampleRate, outSampleRate) {
     if (outSampleRate === sampleRate) {
       return buffer;
@@ -69,7 +237,6 @@ function ChatInterface() {
     return result;
   }
 
-  // Helper: Convert an Int16Array to a Base64 encoded string
   function int16ToBase64(int16Array) {
     let binary = "";
     const bytes = new Uint8Array(int16Array.buffer);
@@ -79,7 +246,6 @@ function ChatInterface() {
     return btoa(binary);
   }
 
-  // Helper: Encode raw PCM samples into a minimal WAV container for playback
   function encodeWAV(samples, sampleRate) {
     const buffer = new ArrayBuffer(44 + samples.length * 2);
     const view = new DataView(buffer);
@@ -108,95 +274,123 @@ function ChatInterface() {
     return new Blob([view], { type: "audio/wav" });
   }
 
-  // Start voice recording: establishes WebSocket connection and begins audio capture.
   const startVoiceRecording = async () => {
     setRecording(true);
-    const ws = new WebSocket(GEMINI_WS_URL);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      console.log("WebSocket connection opened");
-      // Send initial setup message with audio configuration.
-      const setupMessage = {
-        setup: {
-          model: "models/gemini-2.0-flash-exp",
-          generationConfig: {
-            responseModalities: ["AUDIO"],
-            maxOutputTokens: 1000,
-            temperature: 0.5,
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: "Kore" // Choose desired voice
+    setIsThinking(false);
+    try {
+      const ws = new WebSocket(GEMINI_WS_URL);
+      wsRef.current = ws;
+  
+      ws.onopen = () => {
+        console.log("WebSocket connection opened");
+        const setupMessage = {
+          setup: {
+            model: "models/gemini-2.0-flash-exp",
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              maxOutputTokens: 1000,
+              temperature: 0.5,
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: {
+                    voiceName: "Kore"
+                  }
                 }
               }
-            }
-          },
-          systemInstruction: "Respond using audio only."
+            },
+            systemInstruction: "Respond using audio only."
+          }
+        };
+        ws.send(JSON.stringify(setupMessage));
+      };
+  
+      ws.onmessage = async (event) => {
+        if (typeof event.data === "string") {
+          const messageData = JSON.parse(event.data);
+          console.log("Received JSON message:", messageData);
+          if (messageData.response && messageData.response.text) {
+            const aiVoiceMessage = { id: Date.now(), content: messageData.response.text, sender: "ai" };
+            const updatedConvs = conversations.map((conv) => {
+              if (conv.id === currentConversationId) {
+                return { ...conv, messages: [...conv.messages, aiVoiceMessage] };
+              }
+              return conv;
+            });
+            updateConversations(updatedConvs);
+            setIsThinking(false);
+          }
+        } else if (event.data instanceof Blob) {
+          console.log("Received audio Blob");
+          const arrayBuffer = await event.data.arrayBuffer();
+          const samples = new Int16Array(arrayBuffer);
+          const wavBlob = encodeWAV(samples, 24000);
+          const url = URL.createObjectURL(wavBlob);
+          const audio = new Audio(url);
+          audio.play();
         }
       };
-      ws.send(JSON.stringify(setupMessage));
-    };
-
-    ws.onmessage = async (event) => {
-      if (typeof event.data === "string") {
-        const message = JSON.parse(event.data);
-        console.log("Received JSON message:", message);
-      } else if (event.data instanceof Blob) {
-        console.log("Received audio Blob");
-        // Assume the Blob contains raw PCM Int16 data at 24kHz. Convert to WAV and play.
-        const arrayBuffer = await event.data.arrayBuffer();
-        const samples = new Int16Array(arrayBuffer);
-        const wavBlob = encodeWAV(samples, 24000);
-        const url = URL.createObjectURL(wavBlob);
-        const audio = new Audio(url);
-        audio.play();
-      }
-    };
-
-    ws.onerror = (error) => {
-      console.error("WebSocket error:", error);
-    };
-
-    // Request microphone access
+  
+      ws.onerror = (error) => {
+        console.error("WebSocket error:", error);
+      };
+    } catch (err) {
+      console.error("Failed to establish WebSocket connection:", err);
+    }
+  
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     mediaStreamRef.current = stream;
     const audioContext = new (window.AudioContext || window.webkitAudioContext)();
     audioContextRef.current = audioContext;
-
     const source = audioContext.createMediaStreamSource(stream);
-    // Create a ScriptProcessorNode to process audio chunks
-    const processor = audioContext.createScriptProcessor(4096, 1, 1);
-    scriptProcessorRef.current = processor;
-
-    source.connect(processor);
-    processor.connect(audioContext.destination);
-
-    processor.onaudioprocess = (e) => {
+  
+    const processorCode = 
+      class PCMProcessor extends AudioWorkletProcessor {
+        process(inputs, outputs, parameters) {
+          const input = inputs[0];
+          if (input && input[0]) {
+            this.port.postMessage(input[0]);
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm-processor', PCMProcessor);
+    ;
+    const blob = new Blob([processorCode], { type: "application/javascript" });
+    const blobURL = URL.createObjectURL(blob);
+    try {
+      await audioContext.audioWorklet.addModule(blobURL);
+    } catch (error) {
+      console.error("Failed to load AudioWorklet module:", error);
+      return;
+    }
+    const workletNode = new AudioWorkletNode(audioContext, "pcm-processor");
+    workletNodeRef.current = workletNode;
+  
+    workletNode.port.onmessage = (event) => {
       if (!recording) return;
-      const inputData = e.inputBuffer.getChannelData(0);
-      // Convert float samples to 16-bit PCM
-      const int16Data = convertFloat32ToInt16(inputData);
-      // Downsample to 16kHz as required by the API
+      const floatSamples = event.data;
+      const int16Data = convertFloat32ToInt16(floatSamples);
       const downsampledData = downsampleBuffer(int16Data, audioContext.sampleRate, 16000);
-      // Convert binary data to a base64 string for JSON transport
       const base64Data = int16ToBase64(downsampledData);
-      const message = {
+      const messageToSend = {
         realtimeInput: {
           media_chunks: [base64Data]
         }
       };
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify(message));
+        wsRef.current.send(JSON.stringify(messageToSend));
       }
     };
+  
+    source.connect(workletNode);
   };
-
-  // Stop voice recording and clean up audio resources.
+  
   const stopVoiceRecording = () => {
     setRecording(false);
-    if (scriptProcessorRef.current) {
-      scriptProcessorRef.current.disconnect();
+    setIsThinking(true);
+    if (workletNodeRef.current) {
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
     }
     if (audioContextRef.current) {
       audioContextRef.current.close();
@@ -210,48 +404,20 @@ function ChatInterface() {
     console.log("Voice recording stopped and WebSocket connection closed");
   };
 
-  // Original dummy data for conversations and messages
-  const conversations = [
-    { id: 1, title: "How to learn React", date: "Today" },
-    { id: 2, title: "Building a portfolio", date: "Today" },
-    { id: 3, title: "JavaScript best practices", date: "Yesterday" },
-    { id: 4, title: "CSS Grid vs Flexbox", date: "Yesterday" },
-  ];
-
-  const messages = [
-    {
-      id: 1,
-      content: "Hello! How can I help you today?",
-      sender: "ai",
-    },
-    {
-      id: 2,
-      content: "I need help with React hooks.",
-      sender: "user",
-    },
-    {
-      id: 3,
-      content:
-        "I'd be happy to help you understand React hooks. What specific aspect would you like to learn about?",
-      sender: "ai",
-    },
-  ];
-
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    // Handle text message submission logic here (e.g., updating messages list)
-    setMessage("");
-  };
-
   return (
     <div className="chat-container">
-      {/* Sidebar */}
+      <style>{`
+        @keyframes pulse {
+          0% { transform: scale(0.9); opacity: 0.7; }
+          50% { transform: scale(1.1); opacity: 1; }
+          100% { transform: scale(0.9); opacity: 0.7; }
+        }
+      `}</style>
       <div className="sidebar">
         <div className="sidebar-content">
-          {/* Profile Section */}
           <div className="profile-section">
             <Avatar
-              src="https://via.placeholder.com/32"
+              src="https://placehold.co/32"
               alt="User Avatar"
               fallback="U"
             />
@@ -259,22 +425,27 @@ function ChatInterface() {
               <p className="profile-name">John Doe</p>
               <p className="profile-plan">Premium Plan</p>
             </div>
-            <Button variant="icon">
-              <FeatherIcon name="settings" className="settings-icon" />
-              <span className="sr-only">Settings</span>
-            </Button>
+            <div className="sidebar-buttons">
+              <Button variant="icon">
+                <FeatherIcon name="settings" className="settings-icon" />
+                <span className="sr-only">Settings</span>
+              </Button>
+              <Button variant="icon" onClick={handleNewConversation}>
+                <FeatherIcon name="edit" className="edit-icon" />
+                <span className="sr-only">New Conversation</span>
+              </Button>
+            </div>
           </div>
-          {/* Conversations List */}
           <div className="conversations-list">
             <div className="conversations-group">
-              {conversations.map((conversation, index) => (
-                <React.Fragment key={conversation.id}>
+              {conversations.map((conv, index) => (
+                <React.Fragment key={conv.id}>
                   {(index === 0 ||
-                    conversations[index - 1].date !== conversation.date) && (
-                    <div className="date-divider">{conversation.date}</div>
+                    conversations[index - 1].date !== conv.date) && (
+                    <div className="date-divider">{conv.date}</div>
                   )}
-                  <button className="conversation-item">
-                    {conversation.title}
+                  <button className="conversation-item" onClick={() => handleSelectConversation(conv.id)}>
+                    {conv.title}
                   </button>
                 </React.Fragment>
               ))}
@@ -282,49 +453,55 @@ function ChatInterface() {
           </div>
         </div>
       </div>
-      {/* Main Chat Area */}
       <div className="chat-main">
         <div className="messages-container">
           <div className="messages-list">
-            {messages.map((msg) => (
-              <div
-                key={msg.id}
-                className={`message-wrapper ${
-                  msg.sender === "user" ? "user-message" : "ai-message"
-                }`}
-              >
-                <div className="message-bubble">{msg.content}</div>
-              </div>
-            ))}
+            {currentConversation.messages.length === 0 ? (
+              <p className="no-messages">No messages yet. Start chatting!</p>
+            ) : (
+              currentConversation.messages.map((msg) => (
+                <div
+                  key={msg.id}
+                  className={`message-wrapper ${
+                    msg.type === "file"
+                      ? "file-message"
+                      : msg.sender === "user"
+                      ? "user-message"
+                      : "ai-message"
+                  }`}
+                >
+                  {msg.type === "file" ? (
+                    <div className="message-bubble file-bubble">
+                      <FeatherIcon name="file-text" className="file-icon" />
+                      <span style={{ marginLeft: "0.5rem" }}>{msg.content}</span>
+                    </div>
+                  ) : msg.sender === "ai" ? (
+                    <div className="message-bubble rich-text" dangerouslySetInnerHTML={{ __html: msg.content }} />
+                  ) : (
+                    <div className="message-bubble">{msg.content}</div>
+                  )}
+                </div>
+              ))
+            )}
           </div>
         </div>
-        {/* Chat Input */}
         <div className="chat-input-container">
-          {/* Conditional Voice Recording Panel */}
-          {isVoiceMode && (
-            <div className="voice-recording-panel" style={{ marginBottom: "1rem" }}>
-              {recording ? (
-                <Button
-                  type="button"
-                  variant="icon"
-                  onClick={stopVoiceRecording}
-                >
-                  <FeatherIcon name="stop-circle" className="voice-icon" />
-                  <span className="sr-only">Stop recording</span>
-                </Button>
-              ) : (
-                <Button
-                  type="button"
-                  variant="icon"
-                  onClick={startVoiceRecording}
-                >
-                  <FeatherIcon name="mic" className="voice-icon" />
-                  <span className="sr-only">Start recording</span>
-                </Button>
-              )}
-            </div>
-          )}
           <form className="chat-form" onSubmit={handleSubmit}>
+            {/* File attachment preview */}
+            {attachedFile && (
+              <div className="attached-file-preview" style={{ backgroundColor: "#f0f0f0", padding: "0.5rem", marginBottom: "0.5rem", borderRadius: "4px", display: "flex", alignItems: "center" }}>
+                <FeatherIcon name="file-text" className="file-icon" />
+                <span style={{ marginLeft: "0.5rem" }}>{attachedFile.fileName}</span>
+              </div>
+            )}
+            <Button
+              type="button"
+              variant="icon"
+              onClick={handleFilePickerClick}
+            >
+              <FeatherIcon name="plus-circle" className="upload-icon" />
+              <span className="sr-only">Upload document</span>
+            </Button>
             <Input
               value={message}
               onChange={(e) => setMessage(e.target.value)}
@@ -343,6 +520,13 @@ function ChatInterface() {
               <FeatherIcon name="arrow-up-circle" className="send-icon" />
               <span className="sr-only">Send message</span>
             </Button>
+            <input
+              type="file"
+              ref={fileInputRef}
+              style={{ display: "none" }}
+              onChange={handleFileUpload}
+              accept=".pdf,.txt,.doc,.docx"
+            />
           </form>
         </div>
       </div>
@@ -351,6 +535,11 @@ function ChatInterface() {
 }
 
 export default ChatInterface;
+
+
+
+
+
 
 
 
